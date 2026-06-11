@@ -7,17 +7,52 @@
 import { Project, Node, SyntaxKind, SourceFile, FunctionDeclaration, MethodDeclaration, ArrowFunction, FunctionExpression, ClassDeclaration } from "ts-morph";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import { CodeDB } from "./db.js";
+import { gitInfo, repoNameFromRemote } from "./git.js";
 
 type CallableNode = FunctionDeclaration | MethodDeclaration | ArrowFunction | FunctionExpression;
 
 export interface AnalyzeOptions {
   repoPath: string;
   dbPath: string;
+  repoName?: string; // override del nombre; si falta se deduce del remote o la carpeta
   verbose?: boolean;
 }
 
-export function analyze(opts: AnalyzeOptions) {
+export interface AnalyzeStats {
+  files: number;
+  symbols: number;
+  calls: number;
+  resolvedCalls: number;
+  repoName: string;
+  commitSha?: string;
+}
+
+/**
+ * Escribe los metadatos del artefacto: el .db viaja del CI al hub multi-repo,
+ * y esta tabla le dice de qué repo/commit viene y si está fresco.
+ */
+function writeRepoMeta(db: CodeDB, repoRoot: string, repoName?: string): { name: string; commitSha?: string } {
+  const git = gitInfo(repoRoot);
+  const name =
+    repoName ??
+    (git.remote ? repoNameFromRemote(git.remote) : undefined) ??
+    path.basename(repoRoot);
+
+  db.setMeta("repo_name", name);
+  if (git.remote) db.setMeta("repo_remote", git.remote);
+  if (git.commitSha) db.setMeta("commit_sha", git.commitSha);
+  if (git.branch) db.setMeta("branch", git.branch);
+  db.setMeta("generated_at", new Date().toISOString());
+  try {
+    const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
+    db.setMeta("fred_version", pkg.version);
+  } catch { /* sin package.json a la vista: prescindible */ }
+  return { name, commitSha: git.commitSha };
+}
+
+export function analyze(opts: AnalyzeOptions): AnalyzeStats {
   const repo = path.resolve(opts.repoPath);
   if (!fs.existsSync(repo)) throw new Error(`No existe la ruta: ${repo}`);
 
@@ -222,11 +257,15 @@ export function analyze(opts: AnalyzeOptions) {
     }
   }
 
-  const stats = {
+  const repoMeta = writeRepoMeta(db, repo, opts.repoName);
+
+  const stats: AnalyzeStats = {
     files: sourceFiles.length,
     symbols: Number((db.db.prepare(`SELECT COUNT(*) c FROM symbols`).get() as any).c),
     calls: resolved + unresolved,
     resolvedCalls: resolved,
+    repoName: repoMeta.name,
+    commitSha: repoMeta.commitSha,
   };
   db.close();
   return stats;

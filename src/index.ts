@@ -1,0 +1,14 @@
+/**
+ * Superficie de librería de fred: lo que consume fred-hub (y cualquier otro
+ * servicio) para federar bases .db y reutilizar el agente RAG sin pasar por la CLI.
+ */
+export { RagAgent, formatUsage } from "./rag.js";
+export type { RagOptions, RagSource, UsageReport, AskResult, AskCallbacks } from "./rag.js";
+export { CodeDB, SCHEMA_VERSION, readMeta } from "./db.js";
+export type { FileRow, SymbolRow, SummaryRow } from "./db.js";
+export { gitInfo, repoNameFromRemote } from "./git.js";
+export type { GitInfo } from "./git.js";
+export { analyze } from "./analyzer.js";
+export type { AnalyzeOptions, AnalyzeStats } from "./analyzer.js";
+export { summarize } from "./summarize.js";
+export { embedSummaries, voyageEmbed } from "./embed.js";

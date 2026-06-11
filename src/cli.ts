@@ -19,6 +19,7 @@
 import { Command } from "commander";
 import { DatabaseSync } from "node:sqlite";
 import { analyze } from "./analyzer.js";
+import { readMeta } from "./db.js";
 import { summarize } from "./summarize.js";
 import { embedSummaries } from "./embed.js";
 import { RagAgent, formatUsage } from "./rag.js";
@@ -32,11 +33,13 @@ program
   .command("analyze")
   .argument("<repo>", "ruta al repositorio TypeScript")
   .option("--db <path>", "archivo SQLite de salida", "code.db")
+  .option("--repo <name>", "nombre del repo en los metadatos (default: remote de git o carpeta)")
   .action((repo, opts) => {
     console.log(`Analizando ${repo} ...`);
     const t0 = Date.now();
-    const stats = analyze({ repoPath: repo, dbPath: opts.db });
+    const stats = analyze({ repoPath: repo, dbPath: opts.db, repoName: opts.repo });
     console.log(`Listo en ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    console.log(`  Repo:      ${stats.repoName}${stats.commitSha ? ` @ ${stats.commitSha.slice(0, 8)}` : ""}`);
     console.log(`  Archivos:  ${stats.files}`);
     console.log(`  Símbolos:  ${stats.symbols}`);
     console.log(`  Llamadas:  ${stats.calls} (${stats.resolvedCalls} resueltas a código del repo)`);
@@ -60,6 +63,14 @@ program
   .option("--db <path>", "archivo SQLite", "code.db")
   .action((opts) => {
     const db = open(opts.db);
+    const meta = readMeta(db);
+    if (meta.repo_name) {
+      const sha = meta.commit_sha ? ` @ ${meta.commit_sha.slice(0, 8)}` : "";
+      const branch = meta.branch ? ` (${meta.branch})` : "";
+      console.log(`Repo: ${meta.repo_name}${sha}${branch}`);
+      if (meta.generated_at) console.log(`  Analizado: ${meta.generated_at}`);
+      console.log();
+    }
     const byKind = db.prepare(`SELECT kind, COUNT(*) c FROM symbols GROUP BY kind ORDER BY c DESC`).all() as any[];
     console.log("Símbolos por tipo:");
     for (const r of byKind) console.log(`  ${String(r.kind).padEnd(10)} ${r.c}`);

@@ -5,14 +5,26 @@
  *   1. search_summaries — búsqueda vectorial (coseno) sobre los resúmenes de
  *      reglas de negocio de la Fase 2, embebiendo la pregunta con Voyage.
  *   2. query_graph — SQL de SOLO LECTURA sobre el grafo estructural de la Fase 1.
- * Las respuestas citan siempre archivo:línea.
+ * Las respuestas citan siempre archivo:línea (repo/archivo:línea con varias fuentes).
+ *
+ * El agente acepta una o varias fuentes (federación multi-repo): cada fuente es
+ * una conexión read-only independiente; la búsqueda vectorial une los embeddings
+ * de todas en memoria y query_graph se ejecuta contra la base del repo indicado.
  */
 import Anthropic from "@anthropic-ai/sdk";
 import { DatabaseSync } from "node:sqlite";
 import { voyageEmbed } from "./embed.js";
+import { readMeta } from "./db.js";
+
+/** Una base .db de un repo analizado, para el modo multi-repo (hub). */
+export interface RagSource {
+  repo: string;
+  dbPath: string;
+}
 
 export interface RagOptions {
-  dbPath: string;
+  dbPath?: string;      // forma clásica: una sola base
+  sources?: RagSource[]; // forma multi-repo: federación de bases
   model?: string;
 }
 
@@ -100,6 +112,48 @@ Reglas:
 - Si no encuentras evidencia en el repo, dilo claramente; no inventes reglas.
 - Responde en el idioma de la pregunta.`;
 
+/**
+ * Prompt para el modo multi-repo (hub): lista las fuentes disponibles y cambia
+ * la regla de citas a repo/archivo:línea. El modo de una sola base usa
+ * SYSTEM_PROMPT tal cual (comportamiento ya validado; no perturbarlo).
+ */
+function multiSystemPrompt(sources: { repo: string; meta: Record<string, string> }[]): string {
+  const repoList = sources
+    .map((s) => {
+      const sha = s.meta.commit_sha ? ` @ ${s.meta.commit_sha.slice(0, 8)}` : "";
+      const at = s.meta.generated_at ? ` (analizado ${s.meta.generated_at})` : "";
+      return `  - ${s.repo}${sha}${at}`;
+    })
+    .join("\n");
+  return `Eres el asistente de consulta de fred: respondes preguntas de arquitectos
+de software sobre VARIOS repositorios ya analizados (estructura + reglas de negocio deducidas).
+Cada repo es un componente de la misma solución; las llamadas entre repos (HTTP, colas)
+no están en el grafo — solo las llamadas internas de cada uno.
+
+Repos disponibles:
+${repoList}
+
+Tienes dos herramientas:
+- search_summaries: búsqueda semántica sobre los resúmenes de reglas de negocio de TODOS los repos
+  (niveles function/module/domain). Úsala para preguntas de negocio: "¿dónde está la regla de descuentos?".
+- query_graph: SQL de solo lectura sobre el grafo estructural de UN repo (parámetro 'repo' obligatorio).
+  Úsala para preguntas estructurales: quién llama a qué, radio de impacto, dependencias, firmas. Esquema:
+    files(id, path, loc)
+    symbols(id, file_id, name, kind, parent, start_line, end_line, signature, doc, exported)
+      -- kind: function | method | class | interface | type | enum | arrow; parent: clase del método
+    calls(caller_id, callee_id, callee_name, line)  -- callee_id NULL = llamada externa no resuelta
+    imports(file_id, module, named)
+    summaries(id, symbol_id, file_id, domain, level, body_hash, text, model, created_at)
+      -- level: function (symbol_id) | module (file_id) | domain (carpeta)
+
+Reglas:
+- SIEMPRE cita la ubicación como repo/archivo:línea para cada afirmación sobre el código.
+- Combina ambas herramientas cuando ayude (p. ej. encontrar la regla con search_summaries y
+  luego el radio de impacto con query_graph sobre calls del repo correspondiente).
+- Si no encuentras evidencia en los repos, dilo claramente; no inventes reglas.
+- Responde en el idioma de la pregunta.`;
+}
+
 const TOOLS: Anthropic.Tool[] = [
   {
     name: "search_summaries",
@@ -137,6 +191,24 @@ const TOOLS: Anthropic.Tool[] = [
   },
 ];
 
+/** Variante multi-repo de TOOLS: query_graph exige indicar el repo. */
+function multiTools(repos: string[]): Anthropic.Tool[] {
+  const tools = structuredClone(TOOLS);
+  const queryGraph = tools.find((t) => t.name === "query_graph")!;
+  queryGraph.description =
+    "Ejecuta una consulta SQL de SOLO LECTURA (un solo SELECT) sobre el grafo estructural de UN repo. " +
+    "Úsala para preguntas estructurales: quién llama a una función, qué llama una función, " +
+    "radio de impacto, dependencias entre módulos, firmas y documentación.";
+  const schema = queryGraph.input_schema as { properties: Record<string, unknown>; required: string[] };
+  schema.properties.repo = {
+    type: "string",
+    enum: repos,
+    description: "Repo sobre el que ejecutar la consulta",
+  };
+  schema.required = ["sql", "repo"];
+  return tools;
+}
+
 interface EmbeddingRow {
   summary_id: number;
   vector: Uint8Array;
@@ -154,43 +226,96 @@ function cosine(a: Float32Array, b: Float32Array): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
 }
 
+interface Source {
+  repo: string;
+  db: DatabaseSync;
+  meta: Record<string, string>;
+}
+
 export class RagAgent {
-  private db: DatabaseSync;
+  private sources: Source[];
   private client: Anthropic;
   private model: string;
+  private systemPrompt: string;
+  private tools: Anthropic.Tool[];
 
   constructor(opts: RagOptions) {
-    this.db = new DatabaseSync(opts.dbPath, { readOnly: true }); // solo lectura: la garantía real de query_graph
+    const specs: RagSource[] = opts.sources?.length
+      ? opts.sources
+      : opts.dbPath
+        ? [{ repo: "", dbPath: opts.dbPath }]
+        : [];
+    if (!specs.length) throw new Error("RagOptions requiere dbPath o sources.");
+
+    this.sources = specs.map((s) => {
+      const db = new DatabaseSync(s.dbPath, { readOnly: true }); // solo lectura: la garantía real de query_graph
+      const meta = readMeta(db);
+      const repo = s.repo || meta.repo_name || "";
+      const n = (db.prepare(`SELECT COUNT(*) c FROM summaries`).get() as any).c;
+      if (!n)
+        throw new Error(
+          `La base${repo ? ` de ${repo}` : ""} no tiene resúmenes. Corre primero: summarize <repo> --db <db>`
+        );
+      return { repo, db, meta };
+    });
+
+    if (this.multi) {
+      const seen = new Set<string>();
+      const dups = new Set<string>();
+      for (const s of this.sources) {
+        if (!s.repo) throw new Error(`Toda fuente multi-repo necesita nombre de repo (falta en ${specs[this.sources.indexOf(s)].dbPath}).`);
+        if (seen.has(s.repo)) dups.add(s.repo);
+        seen.add(s.repo);
+      }
+      if (dups.size)
+        throw new Error(`Nombres de repo duplicados entre las fuentes: ${[...dups].join(", ")}.`);
+    }
+
     this.client = new Anthropic({ maxRetries: 5 });
     this.model = opts.model ?? DEFAULT_MODEL;
+    this.systemPrompt = this.multi ? multiSystemPrompt(this.sources) : SYSTEM_PROMPT;
+    this.tools = this.multi ? multiTools(this.sources.map((s) => s.repo)) : TOOLS;
+  }
 
-    const n = (this.db.prepare(`SELECT COUNT(*) c FROM summaries`).get() as any).c;
-    if (!n) throw new Error("La base no tiene resúmenes. Corre primero: summarize <repo> --db <db>");
+  private get multi(): boolean {
+    return this.sources.length > 1;
   }
 
   private async searchSummaries(query: string, topK = 8, level?: string, usage?: UsageReport): Promise<string> {
     if (!process.env.VOYAGE_API_KEY)
       return "Error: falta VOYAGE_API_KEY para la búsqueda vectorial. Usa query_graph con LIKE sobre summaries.text como alternativa.";
 
-    const rows = this.db.prepare(`SELECT summary_id, vector, dims, model FROM embeddings`).all() as unknown as EmbeddingRow[];
+    // Recolectar los embeddings de todas las fuentes, anotando de cuál viene cada fila
+    const rows: (EmbeddingRow & { src: Source })[] = [];
+    for (const src of this.sources) {
+      const own = src.db.prepare(`SELECT summary_id, vector, dims, model FROM embeddings`).all() as unknown as EmbeddingRow[];
+      for (const r of own) rows.push({ ...r, src });
+    }
     if (!rows.length)
       return "Error: no hay embeddings en la base. Corre `embed` primero, o usa query_graph con LIKE sobre summaries.text.";
 
-    const { vectors, tokens } = await voyageEmbed([query], rows[0].model, process.env.VOYAGE_API_KEY, "query");
-    if (usage) {
-      usage.voyageCalls++;
-      usage.voyageTokens += tokens;
+    // Una llamada a Voyage por modelo de embedding distinto entre fuentes: el coseno
+    // solo es válido dentro del mismo modelo. La fusión por score entre modelos es
+    // una aproximación aceptable (los scores de Voyage viven en rangos similares).
+    const queryVecs = new Map<string, Float32Array>();
+    for (const model of new Set(rows.map((r) => r.model))) {
+      const { vectors, tokens } = await voyageEmbed([query], model, process.env.VOYAGE_API_KEY, "query");
+      if (usage) {
+        usage.voyageCalls++;
+        usage.voyageTokens += tokens;
+      }
+      queryVecs.set(model, new Float32Array(vectors[0]));
     }
-    const q = new Float32Array(vectors[0]);
 
     const scored = rows
       .map((r) => ({
-        id: r.summary_id,
-        score: cosine(q, new Float32Array(r.vector.buffer, r.vector.byteOffset, r.dims)),
+        row: r,
+        score: cosine(queryVecs.get(r.model)!, new Float32Array(r.vector.buffer, r.vector.byteOffset, r.dims)),
       }))
       .sort((a, b) => b.score - a.score);
 
-    const detail = this.db.prepare(`
+    // El SELECT de detalle se prepara por fuente (cada conexión es independiente)
+    const detailSql = `
       SELECT su.level, su.text, su.domain, s.name, s.parent, s.start_line, s.end_line,
              sf.path AS sym_path, f.path AS file_path
       FROM summaries su
@@ -198,28 +323,39 @@ export class RagAgent {
       LEFT JOIN files sf ON sf.id = s.file_id
       LEFT JOIN files f ON f.id = su.file_id
       WHERE su.id = ?
-    `);
+    `;
+    const details = new Map(this.sources.map((s) => [s, s.db.prepare(detailSql)]));
 
     const results: string[] = [];
-    for (const { id, score } of scored) {
+    for (const { row, score } of scored) {
       if (results.length >= topK) break;
-      const r = detail.get(id) as any;
+      const r = details.get(row.src)!.get(row.summary_id) as any;
       if (!r || (level && r.level !== level)) continue;
+      const prefix = this.multi ? `${row.src.repo}/` : "";
       const where =
-        r.level === "function" ? `${r.parent ? r.parent + "." : ""}${r.name} — ${r.sym_path}:${r.start_line}-${r.end_line}`
-        : r.level === "module" ? `módulo ${r.file_path}`
-        : `dominio ${r.domain}/`;
+        r.level === "function" ? `${r.parent ? r.parent + "." : ""}${r.name} — ${prefix}${r.sym_path}:${r.start_line}-${r.end_line}`
+        : r.level === "module" ? `módulo ${prefix}${r.file_path}`
+        : `dominio ${prefix}${r.domain}/`;
       results.push(`[${r.level}] (similitud ${score.toFixed(3)}) ${where}\n${r.text}`);
     }
     return results.length ? results.join("\n\n") : "Sin resultados para esa consulta.";
   }
 
-  private queryGraph(sql: string): string {
+  private queryGraph(sql: string, repo?: string): string {
+    let db: DatabaseSync;
+    if (this.multi) {
+      const src = this.sources.find((s) => s.repo === repo);
+      if (!src)
+        return `Error: indica el parámetro 'repo'. Repos disponibles: ${this.sources.map((s) => s.repo).join(", ")}.`;
+      db = src.db;
+    } else {
+      db = this.sources[0].db;
+    }
     const clean = sql.trim().replace(/;\s*$/, "");
     if (!/^select\b/i.test(clean) || clean.includes(";"))
       return "Error: solo se permite un único statement SELECT.";
     try {
-      const rows = this.db.prepare(clean).all() as Record<string, unknown>[];
+      const rows = db.prepare(clean).all() as Record<string, unknown>[];
       if (!rows.length) return "0 filas.";
       const shown = rows.slice(0, MAX_SQL_ROWS);
       const out = JSON.stringify(shown, (_k, v) => (typeof v === "bigint" ? Number(v) : v), 1);
@@ -249,8 +385,8 @@ export class RagAgent {
         model: this.model,
         max_tokens: 16000,
         thinking: { type: "adaptive" },
-        system: SYSTEM_PROMPT,
-        tools: TOOLS,
+        system: this.systemPrompt,
+        tools: this.tools,
         messages,
       });
       if (callbacks.onText) stream.on("text", callbacks.onText);
@@ -286,7 +422,8 @@ export class RagAgent {
             const { query, top_k, level } = block.input as { query: string; top_k?: number; level?: string };
             result = await this.searchSummaries(query, top_k, level, usage);
           } else if (block.name === "query_graph") {
-            result = this.queryGraph((block.input as { sql: string }).sql);
+            const { sql, repo } = block.input as { sql: string; repo?: string };
+            result = this.queryGraph(sql, repo);
           } else {
             result = `Herramienta desconocida: ${block.name}`;
           }
@@ -301,6 +438,6 @@ export class RagAgent {
   }
 
   close() {
-    this.db.close();
+    for (const s of this.sources) s.db.close();
   }
 }

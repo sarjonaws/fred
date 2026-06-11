@@ -6,6 +6,24 @@
  */
 import { DatabaseSync } from "node:sqlite";
 
+// Versión del esquema. 1 = bases legacy sin tabla meta (implícito); 2 = con meta.
+// Los artefactos .db viajan entre máquinas (CI -> hub): la versión permite al
+// consumidor saber qué puede esperar de la base.
+export const SCHEMA_VERSION = 2;
+
+/**
+ * Lee la tabla meta de una conexión cualquiera (incluso de solo lectura).
+ * Devuelve {} si la base es legacy (sin tabla meta) — los lectores no deben fallar.
+ */
+export function readMeta(db: DatabaseSync): Record<string, string> {
+  const exists = db
+    .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`)
+    .get();
+  if (!exists) return {};
+  const rows = db.prepare(`SELECT key, value FROM meta`).all() as { key: string; value: string }[];
+  return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+}
+
 export interface FileRow {
   id: number;
   path: string;
@@ -44,6 +62,13 @@ export class CodeDB {
     this.db = new DatabaseSync(path);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+
+      -- Metadatos del artefacto: hacen a cada .db auto-descriptivo para que el
+      -- hub multi-repo sepa qué repo/commit indexa y si está fresco.
+      CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS files (
         id   INTEGER PRIMARY KEY,
@@ -109,6 +134,28 @@ export class CodeDB {
         model      TEXT NOT NULL
       );
     `);
+    // CodeDB solo se usa en rutas de escritura (analyze/summarize/embed); al abrir,
+    // la base ya tiene este esquema, así que la versión queda sellada aquí.
+    this.setMeta("schema_version", String(SCHEMA_VERSION));
+  }
+
+  // ---- Metadatos del artefacto ----------------------------------------------
+
+  setMeta(key: string, value: string) {
+    this.db
+      .prepare(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      .run(key, value);
+  }
+
+  getMeta(key: string): string | undefined {
+    const r = this.db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as
+      | { value: string }
+      | undefined;
+    return r?.value;
+  }
+
+  getAllMeta(): Record<string, string> {
+    return readMeta(this.db);
   }
 
   reset() {

@@ -5,6 +5,10 @@
   "bin": {
     "fred": "dist/cli.js"
   },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "types": "./dist/index.d.ts",
   "files": [
     "dist"
   ],

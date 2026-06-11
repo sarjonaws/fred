@@ -11,9 +11,9 @@ Estamos construyendo una plataforma de consulta arquitectónica con dos herramie
 
 **Principio rector:** la lógica de negocio no vive en ningún archivo — está implícita y dispersa. Por eso el pipeline separa la extracción estructural determinística (Fase 1, sin IA) de la elevación semántica (Fase 2, con LLM resumiendo jerárquicamente: función → módulo → dominio).
 
-## Estado actual: Fases 1 y 2 completas y validadas; Fase 3 implementada
+## Estado actual: Fases 1 y 2 completas y validadas; Fase 3 implementada; habilitadores multi-repo hechos
 
-CLI que analiza repos TypeScript y guarda el esqueleto estructural en SQLite (Fase 1, determinístico), más la elevación semántica con Claude API (Fase 2: `src/summarize.ts` + `src/embed.ts`, comandos `summarize`, `summaries`, `embed`). La Fase 2 fue validada (2026-06-10) contra un repo real (`back-appcore-api`, 56 archivos, 74 funciones): los resúmenes capturan reglas de negocio fieles confirmadas por el dueño del código, y todos tienen embedding generado (Voyage AI `voyage-3.5`, 1024 dims). La Fase 3 (`src/rag.ts` + `src/server.ts`, comandos `ask` y `serve`) está implementada y probada contra ese mismo repo: el agente combina búsqueda vectorial y SQL, cita `archivo:línea` y mantiene sesiones multi-turno.
+CLI que analiza repos TypeScript y guarda el esqueleto estructural en SQLite (Fase 1, determinístico), más la elevación semántica con Claude API (Fase 2: `src/summarize.ts` + `src/embed.ts`, comandos `summarize`, `summaries`, `embed`). La Fase 2 fue validada (2026-06-10) contra un repo real (`back-appcore-api`, 56 archivos, 74 funciones): los resúmenes capturan reglas de negocio fieles confirmadas por el dueño del código, y todos tienen embedding generado (Voyage AI `voyage-3.5`, 1024 dims). La Fase 3 (`src/rag.ts` + `src/server.ts`, comandos `ask` y `serve`) está implementada y probada contra ese mismo repo: el agente combina búsqueda vectorial y SQL, cita `archivo:línea` y mantiene sesiones multi-turno. Desde 2026-06-11 cada `.db` es auto-descriptivo (tabla `meta`, esquema v2), `RagAgent` acepta varias fuentes federadas, fred se consume como librería (`exports` en package.json), y existe el hub multi-repo como repo hermano (`../fred-hub`).
 
 ### Stack
 
@@ -28,19 +28,22 @@ CLI que analiza repos TypeScript y guarda el esqueleto estructural en SQLite (Fa
 
 ```
 src/
-  db.ts        # Esquema SQLite y helpers (clase CodeDB) — incluye summaries y embeddings
-  analyzer.ts  # Extracción: 2 pasadas (símbolos, luego grafo de llamadas)
+  db.ts        # Esquema SQLite y helpers (clase CodeDB) — incluye summaries, embeddings y meta (SCHEMA_VERSION, readMeta)
+  git.ts       # Metadatos de git del repo analizado (SHA, rama, remote) con fallback limpio
+  analyzer.ts  # Extracción: 2 pasadas (símbolos, luego grafo de llamadas) + escritura de meta
   summarize.ts # Fase 2: resúmenes jerárquicos con Claude (función → módulo → dominio)
   embed.ts     # Fase 2: embeddings de los resúmenes vía Voyage AI
   rag.ts       # Fase 3: agente RAG (search_summaries vectorial + query_graph SQL solo lectura)
   server.ts    # Fase 3: endpoint de chat Express (POST /chat, sesiones en memoria)
   setup.ts     # Fase 3: preparación interactiva de la sesión (resuelve API keys — env o ~/.fred/credentials.json — y resuelve/crea la base)
   cli.ts       # Comandos: analyze, stats, who-calls, calls-of, search, impact, summarize, summaries, embed, ask, serve
+  index.ts     # Superficie de librería (la consume fred-hub): RagAgent, CodeDB, readMeta, gitInfo, etc.
 sample-shop/   # Repo TypeScript de prueba con lógica de negocio realista
 ```
 
 ### Esquema de la base (SQLite)
 
+- `meta(key, value)` — metadatos del artefacto (esquema v2): `schema_version`, `repo_name`, `repo_remote`, `commit_sha`, `branch`, `generated_at`, `fred_version`. Los escribe `analyze` (`--repo <name>` para forzar el nombre; default: remote de git o carpeta). Bases sin `meta` = legacy v1, toleradas en toda la CLI (`readMeta` devuelve `{}`).
 - `files(id, path, loc)` — archivos relativos a la raíz del repo
 - `symbols(id, file_id, name, kind, parent, start_line, end_line, signature, doc, exported)`
     - `kind`: function | method | class | interface | type | enum | arrow
@@ -110,18 +113,20 @@ Pendiente para cerrar la fase: validación de uso real por el equipo (¿las resp
 
 GitHub App + webhooks (análisis incremental por archivo cambiado, propagando re-resúmenes hacia arriba), multi-repo, y enlace con el grafo de infraestructura Terraform.
 
-### Visión multi-repo: RAG global corporativo (discutida 2026-06-11, no implementada)
+### Visión multi-repo: RAG global corporativo (habilitadores y hub MVP implementados 2026-06-11)
 
 En un corporativo una solución real son varios repos/componentes (potencialmente en varios lenguajes). El plan: cada pipeline de CI (Jenkins) corre `fred analyze && summarize && embed` y publica su `repo.db` como artefacto; un servicio central ("fred-hub") los ingiere y expone el mismo agente RAG con alcance de solución. El `.db` es la pieza correcta porque ya lleva precalculado lo caro (resúmenes + embeddings) y la idempotencia por hash hace barato cada deploy — el hub solo recolecta e indexa, no recomputa.
 
 Escala y decisiones:
 
-- La búsqueda coseno por fuerza bruta de `rag.ts` aguanta el caso corporativo típico (~100 repos × ~120 resúmenes ≈ 12K vectores); no introducir base vectorial dedicada hasta que el volumen lo exija. Consolidar en una SQLite central con columna `repo` (namespace) o federar con `ATTACH DATABASE`; las citas pasan de `archivo:línea` a `repo/archivo:línea`.
-- **Primer habilitador (chico, retrocompatible, hacer pronto):** tabla `meta` en cada `.db` (repo, SHA del commit, fecha de generación, versión del esquema) para que cada artefacto sea auto-descriptivo y el hub sepa qué versión indexa y si está fresco.
+- La búsqueda coseno por fuerza bruta de `rag.ts` aguanta el caso corporativo típico (~100 repos × ~120 resúmenes ≈ 12K vectores); no introducir base vectorial dedicada hasta que el volumen lo exija.
+- **Consolidación elegida (2026-06-11): federación.** El hub abre N `.db` en conexiones read-only separadas (ni SQLite central con remapeo de ids, ni `ATTACH`): el artefacto del CI es la fuente de verdad y refrescar = reemplazar el archivo. `RagAgent` acepta `sources: { repo, dbPath }[]`; con >1 fuente las citas pasan a `repo/archivo:línea`, `query_graph` exige el parámetro `repo` y el system prompt lista los repos. Con una sola fuente el comportamiento validado queda intacto. Si los repos usan modelos de embedding distintos, se embebe la pregunta una vez por modelo y se fusiona por score.
+- ✅ **Primer habilitador:** tabla `meta` en cada `.db` (esquema v2) — ver sección de esquema. Idempotente y retrocompatible.
+- ✅ **Hub MVP:** repo hermano `../fred-hub` (servicio Express delgado que consume fred como librería vía `file:` dependency): escanea un directorio de artefactos (`--dbs`), tolera legacy/incompletos con warnings, y expone `GET /health`, `GET /repos`, `POST /chat` (mismo contrato que `fred serve`) y `POST /reload`. Ver su README para el contrato del artefacto. Nota Windows: el hub bloquea los `.db` abiertos (no se pueden reemplazar en caliente); en Linux el `cp` + `/reload` funciona.
 - **Reto 1 — aristas entre repos:** el type-checker no ve la comunicación HTTP/colas/DB entre componentes. El `impact` global requiere elevar contratos (endpoints expuestos vs. consumidos, topics publicados vs. suscritos) vía OpenAPI/specs, heurísticas o el LLM en la fase de resumen. Es el equivalente de `imports` a nivel solución, y donde el grafo de infraestructura Terraform (herramienta hermana) es el pegamento natural.
 - **Reto 2 — multi-lenguaje:** el esquema `files/symbols/calls/summaries/embeddings` es agnóstico al lenguaje y las Fases 2-3 operan sobre la base, no sobre el código; soportar otro lenguaje = escribir solo el extractor de Fase 1 que llene el mismo esquema.
 
-Orden propuesto: (1) tabla `meta`, (2) paso de CI que publique el artefacto, (3) hub de solo lectura con RAG global, (4) contratos entre componentes.
+Orden: (1) ✅ tabla `meta`, (2) paso de CI (Jenkins) que publique el artefacto — pendiente, ver README de fred-hub, (3) ✅ hub de solo lectura con RAG global (MVP), (4) contratos entre componentes — pendiente.
 
 ## Reglas para Claude Code
 
