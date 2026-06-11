@@ -17,6 +17,7 @@
  *   npx tsx src/cli.ts serve --db repo.db --port 3000            (Fase 3, endpoint de chat)
  */
 import { Command } from "commander";
+import { createRequire } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { analyze } from "./analyzer.js";
 import { readMeta } from "./db.js";
@@ -27,7 +28,10 @@ import { serve } from "./server.js";
 import { prepareSession } from "./setup.js";
 
 const program = new Command();
-program.name("fred").description("Analizador estructural de repos TypeScript (Fase 1 del MVP)");
+program
+  .name("fred")
+  .description("Analizador estructural de repos TypeScript (Fase 1 del MVP)")
+  .version((createRequire(import.meta.url)("../package.json") as { version: string }).version);
 
 program
   .command("analyze")

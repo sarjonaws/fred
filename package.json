@@ -2,6 +2,10 @@
   "name": "@sarjonaws/fred",
   "version": "0.1.0",
   "description": "Deduce la lógica de negocio de un repo TypeScript: análisis estructural + resúmenes LLM + consulta RAG desde la terminal",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sarjonaws/fred.git"
+  },
   "bin": {
     "fred": "dist/cli.js"
   },
