@@ -1,6 +1,6 @@
-# biz-analyzer — MVP Fases 1, 2 y 3
+# fred — MVP Fases 1, 2 y 3
 
-Analizador de repositorios TypeScript que deduce la lógica de negocio de un repo y la vuelve consultable por arquitectos de software.
+Analizador de repositorios TypeScript que deduce la lógica de negocio de un repo y la vuelve consultable por arquitectos de software. El nombre es un homenaje a Fred Brooks, arquitecto del IBM System/360 y pionero de la arquitectura de software.
 
 - **Fase 1 (determinística, sin IA):** parsea el repo con el compilador real de TypeScript (vía `ts-morph`), extrae símbolos, documentación y el grafo de llamadas, y lo guarda en SQLite.
 - **Fase 2 (elevación semántica):** recorre el grafo de llamadas de hoja a raíz y resume con Claude la *regla de negocio* de cada función (usando los resúmenes de sus callees como contexto), luego cada módulo y cada dominio. Genera embeddings de los resúmenes con Voyage AI.
@@ -12,8 +12,26 @@ Analizador de repositorios TypeScript que deduce la lógica de negocio de un rep
 
 ## Instalación
 
+Requisito único: Node.js >= 22. Para instalar el comando `fred` en cualquier equipo, directo desde GitHub (no hace falta clonar):
+
+```bash
+npm install -g git+https://github.com/sarjonaws/code-busisness-analizer.git
+fred --help
+```
+
+Desde una copia local del repo:
+
 ```bash
 npm install
+npm install -g .    # o `npm link` durante el desarrollo
+fred --help
+```
+
+Para desarrollo sin instalar, todos los comandos funcionan igual con `npx tsx src/cli.ts` en lugar de `fred`:
+
+```bash
+npm install
+npx tsx src/cli.ts --help
 ```
 
 ## Uso
@@ -37,12 +55,14 @@ npx tsx src/cli.ts summaries applyDiscount --db repo.db             # inspeccion
 # 4. Embeddings de los resúmenes (requiere VOYAGE_API_KEY)
 npx tsx src/cli.ts embed --db repo.db
 
-# 5. Consultas RAG (Fase 3, requiere ambas claves)
+# 5. Consultas RAG (Fase 3 — si faltan las claves o la base, el CLI las pide al iniciar)
 npx tsx src/cli.ts ask "¿Dónde está la regla de descuentos y qué se rompe si la cambio?" --db repo.db
 npx tsx src/cli.ts tui --db repo.db                 # interfaz interactiva TUI (recomendada)
 npx tsx src/cli.ts chat --db repo.db                # REPL simple (funciona también con stdin por pipe)
 npx tsx src/cli.ts serve --db repo.db --port 3000   # endpoint de chat HTTP
 ```
+
+`ask`, `chat` y `tui` preparan la sesión antes de empezar: si falta `ANTHROPIC_API_KEY` o `VOYAGE_API_KEY` las piden por teclado (entrada oculta) y ofrecen guardarlas en `~/.fred/credentials.json` para no pedirlas en cada sesión (las variables de entorno, si existen, tienen prioridad). Si la base de `--db` no existe ofrecen las `.db` del directorio actual o construyen una nueva pidiendo la ruta del proyecto (analyze → summarize → embed, requiere las claves). Si la base existe pero le faltan resúmenes o embeddings, completan solo lo pendiente. En entornos sin terminal interactiva (pipes, CI) no preguntan nada: validan y fallan con un mensaje accionable.
 
 El comando `tui` abre la interfaz interactiva (Ink): markdown renderizado a colores, spinner, respuestas en streaming, herramientas visibles mientras el agente trabaja, contexto multi-turno y comandos `/nueva` (reiniciar sesión), `/uso` (costo acumulado) y `/salir`. Lo que escribas mientras responde se encola como siguiente pregunta. `chat` es la versión sin dependencias de UI (solo `node:readline`), útil para pipes y entornos sin TTY.
 

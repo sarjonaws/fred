@@ -1,9 +1,19 @@
 {
-  "name": "biz-analyzer",
+  "name": "@sarjonaws/fred",
   "version": "0.1.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Deduce la lógica de negocio de un repo TypeScript: análisis estructural + resúmenes LLM + consulta RAG desde la terminal",
+  "bin": {
+    "fred": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
     "analyze": "tsx src/cli.ts analyze",
     "cli": "tsx src/cli.ts"
   },

@@ -23,9 +23,10 @@ import { summarize } from "./summarize.js";
 import { embedSummaries } from "./embed.js";
 import { RagAgent, formatUsage } from "./rag.js";
 import { serve } from "./server.js";
+import { prepareSession } from "./setup.js";
 
 const program = new Command();
-program.name("biz-analyzer").description("Analizador estructural de repos TypeScript (Fase 1 del MVP)");
+program.name("fred").description("Analizador estructural de repos TypeScript (Fase 1 del MVP)");
 
 program
   .command("analyze")
@@ -242,7 +243,8 @@ program
   .option("--db <path>", "archivo SQLite", "code.db")
   .option("--model <id>", "modelo de Claude", "claude-opus-4-8")
   .action((question, opts) => run(async () => {
-    const agent = new RagAgent({ dbPath: opts.db, model: opts.model });
+    const dbPath = await prepareSession({ dbPath: opts.db, model: opts.model });
+    const agent = new RagAgent({ dbPath, model: opts.model });
     const result = await agent.ask(question, [], {
       onTool: (name, input) => console.log(dim(`  → ${name} ${JSON.stringify(input)}`)),
       onText: (delta) => process.stdout.write(delta),
@@ -257,8 +259,9 @@ program
   .option("--db <path>", "archivo SQLite", "code.db")
   .option("--model <id>", "modelo de Claude", "claude-opus-4-8")
   .action((opts) => run(async () => {
+    const dbPath = await prepareSession({ dbPath: opts.db, model: opts.model });
     const { createInterface } = await import("node:readline");
-    const agent = new RagAgent({ dbPath: opts.db, model: opts.model });
+    const agent = new RagAgent({ dbPath, model: opts.model });
     const rl = createInterface({ input: process.stdin, output: process.stdout });
 
     // Cola de líneas propia: lo escrito mientras el agente trabaja no se pierde,
@@ -284,7 +287,7 @@ program
     let history: Parameters<RagAgent["ask"]>[1] = [];
     const sessionTotal = { calls: 0, cost: 0 };
 
-    console.log(bold(`biz-analyzer chat`) + dim(`  ·  base: ${opts.db}  ·  modelo: ${opts.model}`));
+    console.log(bold(`fred chat`) + dim(`  ·  base: ${dbPath}  ·  modelo: ${opts.model}`));
     console.log(dim(`Comandos: /nueva (reiniciar sesión), /uso (acumulado), /salir (o Ctrl+C)\n`));
 
     while (true) {
@@ -331,9 +334,10 @@ program
   .option("--db <path>", "archivo SQLite", "code.db")
   .option("--model <id>", "modelo de Claude", "claude-opus-4-8")
   .action((opts) => run(async () => {
+    const dbPath = await prepareSession({ dbPath: opts.db, model: opts.model });
     // Import dinámico: no cargar React/Ink para los demás comandos
     const { runTui } = await import("./tui.js");
-    runTui({ dbPath: opts.db, model: opts.model });
+    runTui({ dbPath, model: opts.model });
   }));
 
 program

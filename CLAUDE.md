@@ -1,4 +1,4 @@
-# CLAUDE.md — biz-analyzer
+# CLAUDE.md — fred
 
 Contexto del proyecto para Claude Code. Léelo completo antes de hacer cambios.
 
@@ -6,7 +6,7 @@ Contexto del proyecto para Claude Code. Léelo completo antes de hacer cambios.
 
 Estamos construyendo una plataforma de consulta arquitectónica con dos herramientas hermanas:
 
-1. **biz-analyzer (este repo):** deduce la lógica de negocio de un repositorio de código. Pipeline: conectar repo → parsear → extraer estructura → resumir semánticamente con LLM → embeddings → memoria RAG consultable. El usuario final es un arquitecto de software que pregunta cosas como "¿dónde está implementada la regla de descuentos?" o "¿qué se rompe si cambio el modelo de Usuario?".
+1. **fred (este repo):** deduce la lógica de negocio de un repositorio de código. Pipeline: conectar repo → parsear → extraer estructura → resumir semánticamente con LLM → embeddings → memoria RAG consultable. El usuario final es un arquitecto de software que pregunta cosas como "¿dónde está implementada la regla de descuentos?" o "¿qué se rompe si cambio el modelo de Usuario?".
 2. **Herramienta de infraestructura (futura):** parsea IaC (Terraform) y construye un grafo de la infraestructura empresarial. Ambos grafos (negocio + infra) se enlazarán para responder consultas de viabilidad: "¿es viable esta solución dada nuestra infraestructura, políticas y costos?".
 
 **Principio rector:** la lógica de negocio no vive en ningún archivo — está implícita y dispersa. Por eso el pipeline separa la extracción estructural determinística (Fase 1, sin IA) de la elevación semántica (Fase 2, con LLM resumiendo jerárquicamente: función → módulo → dominio).
@@ -21,7 +21,8 @@ CLI que analiza repos TypeScript y guarda el esqueleto estructural en SQLite (Fa
 - TypeScript + ESM (`"type": "module"` — los imports internos llevan extensión `.js`)
 - `ts-morph` para parseo (NO tree-sitter: necesitamos el type-checker para resolver llamadas a través de imports)
 - `commander` para el CLI
-- `tsx` para ejecutar sin compilar
+- `tsx` para ejecutar sin compilar en desarrollo
+- Distribución como paquete npm: `npm run build` (tsc → `dist/`) y `bin` `fred` (`npm install -g .` o `npm link`); solo se publica `dist/`
 
 ### Estructura
 
@@ -33,6 +34,7 @@ src/
   embed.ts     # Fase 2: embeddings de los resúmenes vía Voyage AI
   rag.ts       # Fase 3: agente RAG (search_summaries vectorial + query_graph SQL solo lectura)
   server.ts    # Fase 3: endpoint de chat Express (POST /chat, sesiones en memoria)
+  setup.ts     # Fase 3: preparación interactiva de la sesión (resuelve API keys — env o ~/.fred/credentials.json — y resuelve/crea la base)
   cli.ts       # Comandos: analyze, stats, who-calls, calls-of, search, impact, summarize, summaries, embed, ask, serve
 sample-shop/   # Repo TypeScript de prueba con lógica de negocio realista
 ```
@@ -100,7 +102,7 @@ Convenciones aplicadas: `ANTHROPIC_API_KEY` vía env; reintentos con backoff (SD
 
 ### Fase 3 — Capa de consulta RAG (implementada)
 
-`src/rag.ts` (agente, clase `RagAgent`) + `src/server.ts` (Express). Claude (`claude-opus-4-8`, loop agéntico manual) tiene dos herramientas: `search_summaries` (similitud coseno sobre los embeddings; la pregunta se embebe con Voyage `input_type: "query"`) y `query_graph` (SQL sobre conexión SQLite de solo lectura, un solo SELECT, máx 50 filas). Las respuestas citan `archivo:línea`. Comandos: `ask <pregunta>` (un turno, con streaming), `tui` (interfaz interactiva con Ink/React: markdown ANSI vía marked-terminal, spinner, transcript con `<Static>`, cola de entrada; requiere TTY — `src/tui.tsx`), `chat` (REPL equivalente solo con `node:readline`, funciona con stdin por pipe) y `serve --port` (POST /chat con `session_id`, historial en memoria). Excepción aceptada a "sin dependencias pesadas": ink/react/marked son la interfaz principal de consulta. Cada turno reporta su uso (`UsageReport`): llamadas/tokens de Claude y Voyage + costo estimado en USD (tabla `PRICING` en `rag.ts`; actualizarla si cambian las tarifas). Probada contra `back-appcore-api`: combina ambas herramientas, traza radios de impacto y mantiene contexto multi-turno.
+`src/rag.ts` (agente, clase `RagAgent`) + `src/server.ts` (Express). Claude (`claude-opus-4-8`, loop agéntico manual) tiene dos herramientas: `search_summaries` (similitud coseno sobre los embeddings; la pregunta se embebe con Voyage `input_type: "query"`) y `query_graph` (SQL sobre conexión SQLite de solo lectura, un solo SELECT, máx 50 filas). Las respuestas citan `archivo:línea`. Comandos: `ask <pregunta>` (un turno, con streaming), `tui` (interfaz interactiva con Ink/React: markdown ANSI vía marked-terminal, spinner, transcript con `<Static>`, cola de entrada; requiere TTY — `src/tui.tsx`), `chat` (REPL equivalente solo con `node:readline`, funciona con stdin por pipe) y `serve --port` (POST /chat con `session_id`, historial en memoria). Excepción aceptada a "sin dependencias pesadas": ink/react/marked son la interfaz principal de consulta. Cada turno reporta su uso (`UsageReport`): llamadas/tokens de Claude y Voyage + costo estimado en USD (tabla `PRICING` en `rag.ts`; actualizarla si cambian las tarifas). Antes de abrir `ask`/`chat`/`tui`, `src/setup.ts` (`prepareSession`) resuelve las API keys (entorno → `~/.fred/credentials.json` → pedirlas por teclado con entrada oculta, ofreciendo guardarlas para futuras sesiones) y resuelve la base: confirma la existente y completa fases pendientes (resúmenes/embeddings), ofrece las `.db` del directorio, o la construye desde cero pidiendo la ruta del proyecto (analyze → summarize → embed). Sin TTY (pipes/CI) no pregunta: valida y falla con mensaje accionable. Probada contra `back-appcore-api`: combina ambas herramientas, traza radios de impacto y mantiene contexto multi-turno.
 
 Pendiente para cerrar la fase: validación de uso real por el equipo (¿las respuestas le sirven a un arquitecto?).
 

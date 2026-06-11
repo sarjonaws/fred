@@ -62,7 +62,7 @@ export function App({ dbPath, model }: TuiOptions) {
     `Acumulado de la sesión: ${totalsRef.current.calls} llamadas a Claude, ~$${totalsRef.current.cost.toFixed(4)} USD`;
 
   const processQuestion = async (question: string): Promise<void> => {
-    push(`Coco Arquitect › ${question}`, { color: "cyan" });
+    push(`Coco Architech AI› ${question}`, { color: "cyan" });
 
     if (question === "/salir" || question === "/exit") {
       push(totalsLine(), { dim: true });
@@ -139,7 +139,7 @@ export function App({ dbPath, model }: TuiOptions) {
       )}
 
       <Box borderStyle="round" borderColor="gray" paddingX={1} marginTop={busy ? 0 : 1}>
-        <Text color="cyan" bold>tú › </Text>
+        <Text color="cyan" bold>Coco Architech AI › </Text>
         <TextInput value={input} onChange={setInput} onSubmit={onSubmit} placeholder="pregunta, o /nueva /uso /salir" />
       </Box>
       <Box paddingX={1}>

@@ -42,7 +42,6 @@ export interface AskCallbacks {
 const DEFAULT_MODEL = "claude-opus-4-8";
 const MAX_TURNS = 15;      // tope de iteraciones del loop agéntico
 const MAX_SQL_ROWS = 50;   // tope de filas devueltas por query_graph
-
 // USD por millón de tokens (entrada/salida). El costo de Voyage no se estima
 // (tarifa distinta y despreciable); se reportan sus tokens y llamadas.
 const PRICING: Record<string, { in: number; out: number }> = {
@@ -78,7 +77,7 @@ export function formatUsage(u: UsageReport): string {
   return `${claude}${voyage}${cost}`;
 }
 
-const SYSTEM_PROMPT = `Eres el asistente de consulta de biz-analyzer: respondes preguntas de arquitectos
+const SYSTEM_PROMPT = `Eres el asistente de consulta de fred: respondes preguntas de arquitectos
 de software sobre un repositorio ya analizado (estructura + reglas de negocio deducidas).
 
 Tienes dos herramientas:

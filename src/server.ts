@@ -49,7 +49,7 @@ export function serve(opts: ServeOptions) {
 
   const port = opts.port ?? 3000;
   app.listen(port, () => {
-    console.log(`biz-analyzer escuchando en http://localhost:${port}`);
+    console.log(`fred escuchando en http://localhost:${port}`);
     console.log(`  Base: ${opts.dbPath}`);
     console.log(`  Prueba: curl -X POST http://localhost:${port}/chat -H "Content-Type: application/json" -d "{\\"question\\": \\"¿dónde está la regla de descuentos?\\"}"`);
   });
