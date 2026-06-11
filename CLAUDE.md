@@ -110,6 +110,19 @@ Pendiente para cerrar la fase: validación de uso real por el equipo (¿las resp
 
 GitHub App + webhooks (análisis incremental por archivo cambiado, propagando re-resúmenes hacia arriba), multi-repo, y enlace con el grafo de infraestructura Terraform.
 
+### Visión multi-repo: RAG global corporativo (discutida 2026-06-11, no implementada)
+
+En un corporativo una solución real son varios repos/componentes (potencialmente en varios lenguajes). El plan: cada pipeline de CI (Jenkins) corre `fred analyze && summarize && embed` y publica su `repo.db` como artefacto; un servicio central ("fred-hub") los ingiere y expone el mismo agente RAG con alcance de solución. El `.db` es la pieza correcta porque ya lleva precalculado lo caro (resúmenes + embeddings) y la idempotencia por hash hace barato cada deploy — el hub solo recolecta e indexa, no recomputa.
+
+Escala y decisiones:
+
+- La búsqueda coseno por fuerza bruta de `rag.ts` aguanta el caso corporativo típico (~100 repos × ~120 resúmenes ≈ 12K vectores); no introducir base vectorial dedicada hasta que el volumen lo exija. Consolidar en una SQLite central con columna `repo` (namespace) o federar con `ATTACH DATABASE`; las citas pasan de `archivo:línea` a `repo/archivo:línea`.
+- **Primer habilitador (chico, retrocompatible, hacer pronto):** tabla `meta` en cada `.db` (repo, SHA del commit, fecha de generación, versión del esquema) para que cada artefacto sea auto-descriptivo y el hub sepa qué versión indexa y si está fresco.
+- **Reto 1 — aristas entre repos:** el type-checker no ve la comunicación HTTP/colas/DB entre componentes. El `impact` global requiere elevar contratos (endpoints expuestos vs. consumidos, topics publicados vs. suscritos) vía OpenAPI/specs, heurísticas o el LLM en la fase de resumen. Es el equivalente de `imports` a nivel solución, y donde el grafo de infraestructura Terraform (herramienta hermana) es el pegamento natural.
+- **Reto 2 — multi-lenguaje:** el esquema `files/symbols/calls/summaries/embeddings` es agnóstico al lenguaje y las Fases 2-3 operan sobre la base, no sobre el código; soportar otro lenguaje = escribir solo el extractor de Fase 1 que llene el mismo esquema.
+
+Orden propuesto: (1) tabla `meta`, (2) paso de CI que publique el artefacto, (3) hub de solo lectura con RAG global, (4) contratos entre componentes.
+
 ## Reglas para Claude Code
 
 - Mantén todo el código y comentarios en el estilo existente (comentarios en español, código en inglés).
