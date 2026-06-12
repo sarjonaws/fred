@@ -1,6 +1,6 @@
 {
   "name": "@sarjonaws/fred",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Deduce la lógica de negocio de un repo TypeScript: análisis estructural + resúmenes LLM + consulta RAG desde la terminal",
   "repository": {
     "type": "git",
