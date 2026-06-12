@@ -13,7 +13,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { DatabaseSync } from "node:sqlite";
 import { analyze } from "./analyzer.js";
@@ -178,7 +178,7 @@ async function createDatabase(dbPath: string, model: string): Promise<string> {
   console.log(dim(`  ${a.files} archivos, ${a.symbols} símbolos, ${a.calls} llamadas (${a.resolvedCalls} resueltas)`));
   await summarizeAndReport(dbPath, repo, model);
   await embedAndReport(dbPath);
-  console.log();
+  console.log(`Base lista en ${bold(dbPath)}\n`);
   return dbPath;
 }
 
@@ -192,7 +192,7 @@ async function resolveDatabase(opts: SetupOptions, interactive: boolean): Promis
     );
     if (!/^n/i.test(ok)) return opts.dbPath;
     const name = await question(`Archivo para la nueva base ${dim(`(Enter = regenerar ${opts.dbPath})`)}: `);
-    return createDatabase(name || opts.dbPath, opts.model);
+    return createDatabase(name ? resolve(name) : opts.dbPath, opts.model);
   }
 
   if (!interactive)
@@ -207,7 +207,7 @@ async function resolveDatabase(opts: SetupOptions, interactive: boolean): Promis
     others.forEach((f, i) => console.log(`  ${i + 1}. ${f}`));
     const pick = await question("Número de la base a usar, o Enter para crear una nueva: ");
     const idx = Number(pick);
-    if (pick && Number.isInteger(idx) && idx >= 1 && idx <= others.length) return others[idx - 1];
+    if (pick && Number.isInteger(idx) && idx >= 1 && idx <= others.length) return resolve(others[idx - 1]);
   }
   return createDatabase(opts.dbPath, opts.model);
 }
@@ -237,7 +237,9 @@ async function completeDatabase(dbPath: string, model: string, interactive: bool
 export async function prepareSession(opts: SetupOptions): Promise<string> {
   const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
   await ensureApiKeys(interactive);
-  const dbPath = await resolveDatabase(opts, interactive);
+  // Ruta absoluta desde el inicio: todos los mensajes (y el pie del TUI) deben
+  // mostrar DÓNDE vive la base realmente, no el valor relativo de --db.
+  const dbPath = await resolveDatabase({ ...opts, dbPath: resolve(opts.dbPath) }, interactive);
   await completeDatabase(dbPath, opts.model, interactive);
   return dbPath;
 }
