@@ -16,10 +16,13 @@ import { DatabaseSync } from "node:sqlite";
 import { voyageEmbed } from "./embed.js";
 import { readMeta } from "./db.js";
 
-/** Una base .db de un repo analizado, para el modo multi-repo (hub). */
+/** Una base de un repo analizado, para el modo multi-repo (hub). */
 export interface RagSource {
   repo: string;
-  dbPath: string;
+  /** Ruta a un .db en disco. Omitir si se provee `db` ya abierta. */
+  dbPath?: string;
+  /** Conexión ya abierta (p. ej. un .fdb descifrado en memoria). Tiene prioridad sobre dbPath. */
+  db?: DatabaseSync;
 }
 
 export interface RagOptions {
@@ -49,11 +52,34 @@ export interface AskResult {
 export interface AskCallbacks {
   onTool?: (name: string, input: unknown) => void;
   onText?: (delta: string) => void; // streaming del texto a medida que se genera
+  onRetry?: (attempt: number, waitMs: number, reason: string) => void; // reintento por error transitorio (API saturada)
 }
 
 const DEFAULT_MODEL = "claude-opus-4-8";
 const MAX_TURNS = 15;      // tope de iteraciones del loop agéntico
 const MAX_SQL_ROWS = 50;   // tope de filas devueltas por query_graph
+// Reintentos propios ante saturación de la API (529 overloaded_error, 429, 5xx),
+// ENCIMA de los del SDK: el SDK reintenta rápido en una ventana corta; estos esperan
+// más (backoff exponencial con jitter) para sobrevivir picos de saturación sostenidos.
+const TRANSIENT_RETRIES = 5;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** ¿El error amerita reintento? Errores transitorios del lado del servidor, no fallos de la petición. */
+function transientReason(e: unknown): string | null {
+  const status = (e as { status?: number })?.status;
+  if (status === 429 || status === 529 || (typeof status === "number" && status >= 500)) {
+    return `HTTP ${status}`;
+  }
+  // El cuerpo del error de Anthropic: { error: { type: "overloaded_error" | ... } }
+  const type =
+    (e as { error?: { error?: { type?: string } } })?.error?.error?.type ??
+    (e as { error?: { type?: string } })?.error?.type;
+  if (type === "overloaded_error" || type === "api_error" || type === "rate_limit_error") return type;
+  return null;
+}
 // USD por millón de tokens (entrada/salida). El costo de Voyage no se estima
 // (tarifa distinta y despreciable); se reportan sus tokens y llamadas.
 const PRICING: Record<string, { in: number; out: number }> = {
@@ -248,7 +274,10 @@ export class RagAgent {
     if (!specs.length) throw new Error("RagOptions requiere dbPath o sources.");
 
     this.sources = specs.map((s) => {
-      const db = new DatabaseSync(s.dbPath, { readOnly: true }); // solo lectura: la garantía real de query_graph
+      // Una conexión ya abierta (p. ej. .fdb descifrado en memoria) tiene prioridad;
+      // si no, se abre el .db en disco de solo lectura (la garantía real de query_graph).
+      if (!s.db && !s.dbPath) throw new Error("Cada fuente requiere dbPath o db.");
+      const db = s.db ?? new DatabaseSync(s.dbPath!, { readOnly: true });
       const meta = readMeta(db);
       const repo = s.repo || meta.repo_name || "";
       const n = (db.prepare(`SELECT COUNT(*) c FROM summaries`).get() as any).c;
@@ -365,6 +394,40 @@ export class RagAgent {
     }
   }
 
+  /**
+   * Crea el stream y devuelve el mensaje final, reintentando ante saturación de la
+   * API (529/429/5xx) con backoff exponencial. Solo reintenta si AÚN no se emitió
+   * texto en ese intento, para no duplicar lo ya mostrado al usuario.
+   */
+  private async streamWithRetry(
+    messages: Anthropic.MessageParam[],
+    callbacks: AskCallbacks
+  ): Promise<Anthropic.Message> {
+    for (let attempt = 0; ; attempt++) {
+      let textEmitted = false;
+      try {
+        const stream = this.client.messages.stream({
+          model: this.model,
+          max_tokens: 16000,
+          thinking: { type: "adaptive" },
+          system: this.systemPrompt,
+          tools: this.tools,
+          messages,
+        });
+        if (callbacks.onText)
+          stream.on("text", (d) => { textEmitted = true; callbacks.onText!(d); });
+        return await stream.finalMessage();
+      } catch (e) {
+        const reason = transientReason(e);
+        if (!reason || textEmitted || attempt >= TRANSIENT_RETRIES) throw e;
+        // backoff exponencial con jitter: ~2s, 4s, 8s, 16s, 32s→tope 30s, + aleatorio
+        const waitMs = Math.min(30_000, 2_000 * 2 ** attempt) + Math.floor(Math.random() * 500);
+        callbacks.onRetry?.(attempt + 1, waitMs, reason);
+        await sleep(waitMs);
+      }
+    }
+  }
+
   /** Un turno de conversación. `history` debe venir de un AskResult previo (o vacío). */
   async ask(
     question: string,
@@ -381,16 +444,7 @@ export class RagAgent {
     };
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
-      const stream = this.client.messages.stream({
-        model: this.model,
-        max_tokens: 16000,
-        thinking: { type: "adaptive" },
-        system: this.systemPrompt,
-        tools: this.tools,
-        messages,
-      });
-      if (callbacks.onText) stream.on("text", callbacks.onText);
-      const response = await stream.finalMessage();
+      const response = await this.streamWithRetry(messages, callbacks);
 
       usage.claudeCalls++;
       usage.inputTokens += response.usage.input_tokens;

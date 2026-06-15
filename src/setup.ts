@@ -19,6 +19,7 @@ import { DatabaseSync } from "node:sqlite";
 import { analyze } from "./analyzer.js";
 import { summarize } from "./summarize.js";
 import { embedSummaries } from "./embed.js";
+import { openFdbToMemory } from "./seal.js";
 
 export interface SetupOptions {
   dbPath: string; // valor de --db (puede no existir todavía)
@@ -127,6 +128,16 @@ async function ensureApiKeys(interactive: boolean): Promise<void> {
     console.log(dim("  guardadas."));
   }
   console.log();
+}
+
+/**
+ * Resuelve las API keys para un comando no interactivo de generación (build):
+ * entorno → ~/.fred/credentials.json → preguntar oculta si hay TTY. Las deja en
+ * process.env para que summarize/embed las lean.
+ */
+export async function resolveApiKeys(): Promise<void> {
+  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+  await ensureApiKeys(interactive);
 }
 
 interface DbStatus {
@@ -242,4 +253,53 @@ export async function prepareSession(opts: SetupOptions): Promise<string> {
   const dbPath = await resolveDatabase({ ...opts, dbPath: resolve(opts.dbPath) }, interactive);
   await completeDatabase(dbPath, opts.model, interactive);
   return dbPath;
+}
+
+/** Resuelve la passphrase del .fdb: flag → env FRED_FDB_PASSPHRASE → preguntar oculta (requiere TTY). */
+async function resolvePassphrase(flag: string | undefined, interactive: boolean): Promise<string> {
+  const fromFlagOrEnv = flag ?? process.env.FRED_FDB_PASSPHRASE;
+  if (fromFlagOrEnv) return fromFlagOrEnv;
+  if (!interactive)
+    throw new Error("Falta la passphrase del .fdb: usa --passphrase o la variable FRED_FDB_PASSPHRASE.");
+  let value = "";
+  while (!value) value = (await questionHidden(`Passphrase del ${bold(".fdb")}: `)).trim();
+  return value;
+}
+
+/**
+ * Pide la passphrase para CIFRAR un .fdb nuevo: flag/env si existen; si no, se
+ * pide por teclado (oculta) con confirmación. Sin flag/env y sin TTY, falla.
+ */
+export async function resolveSealPassphrase(flag?: string): Promise<string> {
+  const fromFlagOrEnv = flag ?? process.env.FRED_FDB_PASSPHRASE;
+  if (fromFlagOrEnv) return fromFlagOrEnv;
+  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+  if (!interactive)
+    throw new Error("Falta la passphrase: usa --passphrase o la variable FRED_FDB_PASSPHRASE.");
+  while (true) {
+    const p1 = (await questionHidden(`Passphrase para cifrar el ${bold(".fdb")}: `)).trim();
+    if (!p1) { console.log(dim("  no puede estar vacía.")); continue; }
+    const p2 = (await questionHidden("Confírmala: ")).trim();
+    if (p1 !== p2) { console.log(dim("  no coinciden, intenta de nuevo.")); continue; }
+    return p1;
+  }
+}
+
+export interface FdbSessionOptions {
+  fdbPath: string;     // ruta al artefacto .fdb cifrado
+  passphrase?: string; // si se omite: env FRED_FDB_PASSPHRASE o se pregunta (TTY)
+}
+
+/**
+ * Prepara una sesión de consulta sobre un .fdb cifrado: resuelve las API keys y la
+ * passphrase, descifra el artefacto y lo carga en una base SQLite EN MEMORIA (los
+ * datos descifrados nunca tocan disco). Devuelve la conexión lista para RagAgent.
+ * Un .fdb ya es autocontenido (se selló tras summarize+embed), así que no hay fases
+ * pendientes que completar — a diferencia de un .db nuevo.
+ */
+export async function prepareFdbSession(opts: FdbSessionOptions): Promise<DatabaseSync> {
+  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+  await ensureApiKeys(interactive);
+  const passphrase = await resolvePassphrase(opts.passphrase, interactive);
+  return openFdbToMemory(resolve(opts.fdbPath), passphrase);
 }

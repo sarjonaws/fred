@@ -12,3 +12,14 @@ export { analyze } from "./analyzer.js";
 export type { AnalyzeOptions, AnalyzeStats } from "./analyzer.js";
 export { summarize } from "./summarize.js";
 export { embedSummaries, voyageEmbed } from "./embed.js";
+export { sealDb, openFdb, openFdbToMemory } from "./seal.js";
+export type { SealResult, OpenResult } from "./seal.js";
+export {
+  encodeFdbHeader,
+  decodeFdbHeader,
+  isFdb,
+  FdbFormatError,
+  FDB_MAGIC,
+  FDB_HEADER_VERSION,
+} from "./fdb.js";
+export type { FdbHeader } from "./fdb.js";

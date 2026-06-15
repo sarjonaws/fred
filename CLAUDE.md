@@ -135,3 +135,26 @@ Orden: (1) ✅ tabla `meta`, (2) paso de CI (Jenkins) que publique el artefacto 
 - Cualquier cambio al esquema de SQLite debe ser retrocompatible o incluir migración en `CodeDB`.
 - Corre la prueba de humo de arriba antes de dar por terminado un cambio.
 - No implementes Fase 3 antes de que Fase 2 esté validada con un repo real.
+
+## Anexo A — Viabilidad de Amazon Bedrock como backend de Claude (posible mejora)
+
+Análisis (2026-06-14) de enrutar las llamadas a Claude por **Amazon Bedrock** en lugar de la API directa de Anthropic, autenticando con credenciales AWS. **Estado: propuesta, no implementada.**
+
+**Veredicto:** viable y de bajo riesgo para las llamadas a Claude; la pieza de embeddings (Voyage) NO se mueve a Bedrock.
+
+Bedrock es operado por AWS (no por Anthropic) pero sirve la misma forma de la Messages API. Todo lo que fred usa de Claude está soportado: `messages.create` (`summarize.ts`), `messages.stream` (`rag.ts`), `tools` cliente-side con loop agéntico manual (`search_summaries` / `query_graph`), `thinking: {type:"adaptive"}`, `stop_reason: "refusal"` / `pause_turn`, y el backoff del SDK (`maxRetries`). Lo que Bedrock NO soporta (Managed Agents, herramientas server-side de Anthropic, Task Budgets, `fallbacks` server-side) fred no lo usa, así que no hay choque.
+
+**Punto clave — los embeddings son independientes del proveedor.** `embed.ts` y `RagAgent.searchSummaries` usan **Voyage AI**, que no vive en Bedrock; mover Claude a Bedrock no mueve Voyage. Caminos:
+- **Recomendado (fase 1):** dejar Voyage tal cual; solo las llamadas a Claude van por Bedrock. Se sigue necesitando `VOYAGE_API_KEY`. Cero recálculo.
+- **Más invasivo:** cambiar a un modelo de embeddings de Bedrock (Titan v2 = 1024 dims, o Cohere). Cambia el espacio vectorial → re-embeber todo, y mezcla espacios distintos entre `.db` federados (aunque `searchSummaries` ya tolera varios modelos fusionando por score). No hacerlo ahora.
+
+**Autenticación "a través de claves":** Bedrock usa credenciales AWS (SigV4): `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ opcional `AWS_SESSION_TOKEN`) y `AWS_REGION`, o rol IAM / perfil. El cliente `AnthropicBedrock` (`@anthropic-ai/bedrock-sdk`) las lee del entorno o del constructor. Encaja con el patrón actual de `setup.ts` (env → `~/.fred/credentials.json` → preguntar): basta agregar estas claves a `API_KEYS` y a la resolución.
+
+**Cambios necesarios (acotados):**
+1. **Cliente:** `npm i @anthropic-ai/bedrock-sdk`. Una factory que devuelva `new Anthropic()` o `new AnthropicBedrock()`; el resto de `summarize.ts`/`rag.ts` no cambia (ambos exponen `.messages.create/.stream` idénticos).
+2. **IDs de modelo:** Bedrock exige prefijo de proveedor → `anthropic.claude-opus-4-8` (a menudo inference profile regional `us.anthropic.claude-opus-4-8`). Un `claude-*` pelado da 400 en Bedrock.
+3. **Tabla `PRICING` (`rag.ts`):** está indexada por `claude-opus-4-8`; con el ID de Bedrock `estimateCost` devuelve `null`. Normalizar la clave (quitar `anthropic.`/`us.`) o añadir entradas Bedrock (sus tarifas difieren un poco de la API directa).
+4. **`summaries.model`:** guardaría el ID con prefijo; conviene normalizar para mantener coherente la idempotencia por hash y el reporte de uso entre proveedores.
+5. **Superficie de librería (`index.ts` → fred-hub):** propagar la elección de proveedor por `RagOptions`/config para que el hub también pueda apuntar a Bedrock.
+
+**Verificar antes de implementar:** (a) que `claude-opus-4-8` esté habilitado en la región/cuenta de Bedrock (model access) — es el bloqueante real más común; (b) cuotas de Bedrock (por región/modelo, distintas a las de la API directa).
