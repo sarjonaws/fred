@@ -18,6 +18,9 @@
  */
 import { Command } from "commander";
 import { createRequire } from "node:module";
+import { basename, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { analyze } from "./analyzer.js";
 import { readMeta } from "./db.js";
@@ -25,7 +28,9 @@ import { summarize } from "./summarize.js";
 import { embedSummaries } from "./embed.js";
 import { RagAgent, formatUsage } from "./rag.js";
 import { serve } from "./server.js";
-import { prepareSession } from "./setup.js";
+import { viewer } from "./viewer.js";
+import { prepareSession, prepareFdbSession, resolveApiKeys, resolveSealPassphrase } from "./setup.js";
+import { sealDb, openFdb } from "./seal.js";
 
 const program = new Command();
 program
@@ -61,6 +66,25 @@ const run = (fn: () => Promise<void>) =>
     console.error(`Error: ${e instanceof Error ? e.message : e}`);
     process.exitCode = 1;
   });
+
+const isFdbPath = (p: string) => /\.fdb$/i.test(p);
+
+/**
+ * Construye el agente RAG para ask/chat. Si --db apunta a un .fdb, lo descifra
+ * en memoria (claves + passphrase vía prepareFdbSession); si es un .db, usa el
+ * flujo interactivo de prepareSession. Devuelve también la etiqueta de la base
+ * para mostrarla en la cabecera del chat.
+ */
+async function buildAgent(opts: { db: string; model: string; passphrase?: string }): Promise<{ agent: RagAgent; label: string }> {
+  if (isFdbPath(opts.db)) {
+    const db = await prepareFdbSession({ fdbPath: opts.db, passphrase: opts.passphrase });
+    const repo = readMeta(db).repo_name ?? "";
+    const agent = new RagAgent({ sources: [{ repo, db }], model: opts.model });
+    return { agent, label: resolve(opts.db) };
+  }
+  const dbPath = await prepareSession({ dbPath: opts.db, model: opts.model });
+  return { agent: new RagAgent({ dbPath, model: opts.model }), label: dbPath };
+}
 
 program
   .command("stats")
@@ -255,14 +279,15 @@ program
 program
   .command("ask")
   .argument("<question>", "pregunta en lenguaje natural sobre el repo analizado")
-  .option("--db <path>", "archivo SQLite", "code.db")
+  .option("--db <path>", "archivo SQLite (.db) o artefacto cifrado (.fdb)", "code.db")
   .option("--model <id>", "modelo de Claude", "claude-opus-4-8")
+  .option("--passphrase <p>", "passphrase si --db es un .fdb (o env FRED_FDB_PASSPHRASE)")
   .action((question, opts) => run(async () => {
-    const dbPath = await prepareSession({ dbPath: opts.db, model: opts.model });
-    const agent = new RagAgent({ dbPath, model: opts.model });
+    const { agent } = await buildAgent({ db: opts.db, model: opts.model, passphrase: opts.passphrase });
     const result = await agent.ask(question, [], {
       onTool: (name, input) => console.log(dim(`  → ${name} ${JSON.stringify(input)}`)),
       onText: (delta) => process.stdout.write(delta),
+      onRetry: (n, ms, why) => console.error(dim(`  API saturada (${why}); reintento ${n} en ${(ms / 1000).toFixed(0)}s ...`)),
     });
     agent.close();
     console.log(`\n\n${dim("─".repeat(60))}\n${dim(formatUsage(result.usage))}`);
@@ -271,12 +296,12 @@ program
 program
   .command("chat")
   .description("sesión interactiva de chat sobre el repo analizado (multi-turno, con streaming)")
-  .option("--db <path>", "archivo SQLite", "code.db")
+  .option("--db <path>", "archivo SQLite (.db) o artefacto cifrado (.fdb)", "code.db")
   .option("--model <id>", "modelo de Claude", "claude-opus-4-8")
+  .option("--passphrase <p>", "passphrase si --db es un .fdb (o env FRED_FDB_PASSPHRASE)")
   .action((opts) => run(async () => {
-    const dbPath = await prepareSession({ dbPath: opts.db, model: opts.model });
+    const { agent, label: dbPath } = await buildAgent({ db: opts.db, model: opts.model, passphrase: opts.passphrase });
     const { createInterface } = await import("node:readline");
-    const agent = new RagAgent({ dbPath, model: opts.model });
     const rl = createInterface({ input: process.stdin, output: process.stdout });
 
     // Cola de líneas propia: lo escrito mientras el agente trabaja no se pierde,
@@ -327,6 +352,7 @@ program
         const result = await agent.ask(question, history, {
           onTool: (name, input) => console.log(dim(`  → ${name} ${JSON.stringify(input)}`)),
           onText: (delta) => process.stdout.write(delta),
+          onRetry: (n, ms, why) => console.error(dim(`  API saturada (${why}); reintento ${n} en ${(ms / 1000).toFixed(0)}s ...`)),
         });
         history = result.history;
         sessionTotal.calls += result.usage.claudeCalls;
@@ -346,13 +372,170 @@ program
 program
   .command("tui")
   .description("interfaz interactiva TUI (Ink): markdown renderizado, spinner, streaming")
-  .option("--db <path>", "archivo SQLite", "code.db")
+  .option("--db <path>", "archivo SQLite (.db) o artefacto cifrado (.fdb)", "code.db")
   .option("--model <id>", "modelo de Claude", "claude-opus-4-8")
+  .option("--passphrase <p>", "passphrase si --db es un .fdb (o env FRED_FDB_PASSPHRASE)")
   .action((opts) => run(async () => {
-    const dbPath = await prepareSession({ dbPath: opts.db, model: opts.model });
+    const { agent, label } = await buildAgent({ db: opts.db, model: opts.model, passphrase: opts.passphrase });
     // Import dinámico: no cargar React/Ink para los demás comandos
     const { runTui } = await import("./tui.js");
-    runTui({ dbPath, model: opts.model });
+    runTui({ agent, label, model: opts.model });
+  }));
+
+// Passphrase de cifrado: flag explícito o env. Sin TTY no preguntamos (CI-friendly).
+const resolvePassphrase = (flag?: string): string => {
+  const p = flag ?? process.env.FRED_FDB_PASSPHRASE;
+  if (!p) {
+    throw new Error(
+      "falta la passphrase: usa --passphrase <p> o la variable de entorno FRED_FDB_PASSPHRASE"
+    );
+  }
+  return p;
+};
+
+program
+  .command("wizard")
+  .description("asistente interactivo (como el TUI): resuelve claves y prepara la base paso a paso, y en vez de abrir el chat genera un .fdb cifrado")
+  .option("--db <path>", "base intermedia / a preparar", "code.db")
+  .option("--out <path>", "archivo .fdb de salida (default: junto a la base)")
+  .option("--passphrase <p>", "passphrase de cifrado (o env FRED_FDB_PASSPHRASE; si falta, se pide)")
+  .option("--model <id>", "modelo de Claude para los resúmenes", "claude-opus-4-8")
+  .option("--keep-db", "conservar la base .db sin cifrar tras generar el .fdb")
+  .action((opts) => run(async () => {
+    if (!(process.stdin.isTTY && process.stdout.isTTY))
+      throw new Error("El asistente requiere una terminal interactiva. Sin TTY usa: build <repo> --out <fdb> --passphrase <p>.");
+
+    // prepareSession hace exactamente lo que el TUI antes de abrir el chat:
+    // resuelve claves y deja una base completa (analyze → summarize → embed).
+    const dbPath = await prepareSession({ dbPath: opts.db, model: opts.model });
+
+    const { createInterface } = await import("node:readline/promises");
+    const ask = async (q: string) => {
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      try { return (await rl.question(q)).trim(); } finally { rl.close(); }
+    };
+
+    const defaultOut = dbPath.replace(/\.db$/i, "") + ".fdb";
+    const out = resolve(opts.out ?? ((await ask(`Archivo .fdb de salida ${dim(`(Enter = ${defaultOut})`)}: `)) || defaultOut));
+    const passphrase = await resolveSealPassphrase(opts.passphrase);
+
+    console.log(`Cifrando en ${bold(out)} ...`);
+    const { bytesWritten, header } = sealDb(dbPath, out, passphrase);
+    console.log(`\n${bold("Listo")}.`);
+    console.log(`  Repo:       ${header.repoName || "(sin meta)"}`);
+    console.log(`  Resúmenes:  ${header.nSummaries ?? "?"}  ·  Embeddings: ${header.nEmbeddings ?? "?"}`);
+    console.log(`  Clave:      ${header.publicKeyFingerprint}`);
+    console.log(`  Salida:     ${out}  (${bytesWritten.toLocaleString()} bytes)`);
+
+    // La base .db queda SIN cifrar; ofrecer borrarla (el .fdb ya tiene todo).
+    if (!opts.keepDb) {
+      const del = await ask(`¿Borrar la base sin cifrar ${dim(dbPath)}? ${dim("(s/N)")}: `);
+      if (/^s/i.test(del)) {
+        try {
+          for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) rmSync(f, { force: true });
+          console.log(dim("  base sin cifrar borrada."));
+        } catch {
+          console.error(dim(`  no se pudo borrar ${dbPath}; bórrala a mano.`));
+        }
+      }
+    }
+  }));
+
+program
+  .command("build")
+  .description("pipeline completo en un paso: analyze → summarize → embed → seal, entregando un .fdb cifrado")
+  .argument("<repo>", "ruta al repositorio TypeScript")
+  .option("--out <path>", "archivo .fdb de salida (default: <repo>.fdb)")
+  .option("--passphrase <p>", "passphrase de cifrado (o env FRED_FDB_PASSPHRASE)")
+  .option("--db <path>", "ruta del .db intermedio (default: temporal; si se indica, se conserva)")
+  .option("--keep-db", "conservar el .db intermedio en vez de borrarlo")
+  .option("--repo <name>", "nombre del repo en los metadatos (default: remote de git o carpeta)")
+  .option("--model <id>", "modelo de Claude para los resúmenes", "claude-opus-4-8")
+  .option("--concurrency <n>", "llamadas concurrentes a la API en summarize", "4")
+  .option("--force", "regenerar resúmenes y embeddings aunque no hayan cambiado")
+  .action((repo, opts) => run(async () => {
+    const passphrase = resolvePassphrase(opts.passphrase);
+    await resolveApiKeys();
+
+    const out = resolve(opts.out ?? basename(resolve(repo)) + ".fdb");
+    // Indicar --db implica conservarlo (es una ruta que el usuario nombró a propósito).
+    const keep = Boolean(opts.keepDb || opts.db);
+    const dbPath = opts.db
+      ? resolve(opts.db)
+      : keep
+        ? out.replace(/\.fdb$/i, "") + ".db"
+        : join(tmpdir(), `fred-build-${process.pid}-${Date.now()}.db`);
+
+    const t0 = Date.now();
+    try {
+      console.log(`Analizando ${repo} ...`);
+      const a = analyze({ repoPath: repo, dbPath, repoName: opts.repo });
+      console.log(dim(`  ${a.files} archivos, ${a.symbols} símbolos, ${a.calls} llamadas (${a.resolvedCalls} resueltas)`));
+
+      console.log(`Resumiendo reglas de negocio con ${opts.model} ${dim("(consume tokens)")} ...`);
+      const s = await summarize({ repoPath: repo, dbPath, model: opts.model, concurrency: Number(opts.concurrency), force: opts.force });
+      console.log(dim(`  ${s.functions.summarized} funciones, ${s.modules.summarized} módulos, ${s.domains.summarized} dominios resumidos`));
+
+      console.log(`Generando embeddings con Voyage ...`);
+      const e = await embedSummaries({ dbPath, force: opts.force });
+      console.log(dim(`  ${e.embedded} generados, ${e.unchanged} sin cambios`));
+
+      console.log(`Cifrando en ${bold(out)} ...`);
+      const { bytesWritten, header } = sealDb(dbPath, out, passphrase);
+
+      console.log(`\nListo en ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      console.log(`  Repo:       ${header.repoName || "(sin meta)"}`);
+      console.log(`  Resúmenes:  ${header.nSummaries ?? "?"}  ·  Embeddings: ${header.nEmbeddings ?? "?"}`);
+      console.log(`  Clave:      ${header.publicKeyFingerprint}`);
+      console.log(`  Salida:     ${out}  (${bytesWritten.toLocaleString()} bytes)`);
+      if (keep) console.log(dim(`  .db intermedio conservado en: ${dbPath}`));
+    } finally {
+      // El .db intermedio es desechable salvo que el usuario pida conservarlo.
+      // Best-effort: si falla el borrado (p. ej. base bloqueada en Windows tras un
+      // error a media tubería) NO debe enmascarar el error real que viene del try.
+      if (!keep) {
+        try {
+          for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) rmSync(f, { force: true });
+        } catch {
+          console.error(dim(`  (no se pudo borrar el .db temporal ${dbPath}; bórralo a mano)`));
+        }
+      }
+    }
+  }));
+
+program
+  .command("seal")
+  .description("cifra un .db en un artefacto .fdb (HEADER claro + payload AES-256-GCM + firma HMAC)")
+  .argument("<db>", "archivo .db de entrada")
+  .option("--out <path>", "archivo .fdb de salida (default: <db> con extensión .fdb)")
+  .option("--passphrase <p>", "passphrase de cifrado (o env FRED_FDB_PASSPHRASE)")
+  .action((db, opts) => run(async () => {
+    const passphrase = resolvePassphrase(opts.passphrase);
+    const out = opts.out ?? db.replace(/\.db$/i, "") + ".fdb";
+    const t0 = Date.now();
+    const { bytesWritten, header } = sealDb(db, out, passphrase);
+    console.log(`Sellado en ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    console.log(`  Repo:       ${header.repoName || "(sin meta)"}`);
+    console.log(`  Schema:     v${header.schemaVersion}`);
+    console.log(`  Resúmenes:  ${header.nSummaries ?? "?"}  ·  Embeddings: ${header.nEmbeddings ?? "?"}`);
+    console.log(`  Clave:      ${header.publicKeyFingerprint}`);
+    console.log(`  Salida:     ${out}  (${bytesWritten.toLocaleString()} bytes)`);
+  }));
+
+program
+  .command("open")
+  .description("descifra y valida un .fdb (firma + auth_tag); muestra el header sin escribir a disco")
+  .argument("<fdb>", "archivo .fdb de entrada")
+  .option("--passphrase <p>", "passphrase de cifrado (o env FRED_FDB_PASSPHRASE)")
+  .action((fdb, opts) => run(async () => {
+    const passphrase = resolvePassphrase(opts.passphrase);
+    const { header, data } = openFdb(fdb, passphrase);
+    console.log(`${bold("OK")}: firma y cifrado verificados; ${data.length.toLocaleString()} bytes descifrados en memoria.`);
+    console.log(`  Repo:       ${header.repoName || "(sin meta)"}`);
+    console.log(`  Schema:     v${header.schemaVersion}`);
+    console.log(`  Generado:   ${header.generatedAt.toISOString()}`);
+    console.log(`  Resúmenes:  ${header.nSummaries ?? "?"}  ·  Embeddings: ${header.nEmbeddings ?? "?"}`);
+    console.log(dim("  (los datos descifrados solo viven en memoria; no se escriben a disco)"));
   }));
 
 program
@@ -362,6 +545,18 @@ program
   .option("--model <id>", "modelo de Claude", "claude-opus-4-8")
   .action((opts) => run(async () => {
     serve({ dbPath: opts.db, port: Number(opts.port), model: opts.model });
+  }));
+
+program
+  .command("view")
+  .description("abre un visor web de solo lectura para inspeccionar un .fdb (datos solo en memoria)")
+  .argument("<fdb>", "archivo .fdb de entrada")
+  .option("--passphrase <p>", "passphrase de cifrado (o env FRED_FDB_PASSPHRASE)")
+  .option("--port <n>", "puerto HTTP", "4000")
+  .option("--no-open", "no abrir el navegador automáticamente")
+  .action((fdb, opts) => run(async () => {
+    const passphrase = resolvePassphrase(opts.passphrase);
+    viewer({ fdbPath: fdb, passphrase, port: Number(opts.port), open: opts.open });
   }));
 
 program.parse();

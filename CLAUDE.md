@@ -11,9 +11,11 @@ Estamos construyendo una plataforma de consulta arquitectónica con dos herramie
 
 **Principio rector:** la lógica de negocio no vive en ningún archivo — está implícita y dispersa. Por eso el pipeline separa la extracción estructural determinística (Fase 1, sin IA) de la elevación semántica (Fase 2, con LLM resumiendo jerárquicamente: función → módulo → dominio).
 
-## Estado actual: Fases 1 y 2 completas y validadas; Fase 3 implementada; habilitadores multi-repo hechos
+## Estado actual: Fases 1 y 2 completas y validadas; Fase 3 implementada; habilitadores multi-repo hechos; artefacto cifrado `.fdb` implementado
 
 CLI que analiza repos TypeScript y guarda el esqueleto estructural en SQLite (Fase 1, determinístico), más la elevación semántica con Claude API (Fase 2: `src/summarize.ts` + `src/embed.ts`, comandos `summarize`, `summaries`, `embed`). La Fase 2 fue validada (2026-06-10) contra un repo real (`back-appcore-api`, 56 archivos, 74 funciones): los resúmenes capturan reglas de negocio fieles confirmadas por el dueño del código, y todos tienen embedding generado (Voyage AI `voyage-3.5`, 1024 dims). La Fase 3 (`src/rag.ts` + `src/server.ts`, comandos `ask` y `serve`) está implementada y probada contra ese mismo repo: el agente combina búsqueda vectorial y SQL, cita `archivo:línea` y mantiene sesiones multi-turno. Desde 2026-06-11 cada `.db` es auto-descriptivo (tabla `meta`, esquema v2), `RagAgent` acepta varias fuentes federadas, fred se consume como librería (`exports` en package.json), y existe el hub multi-repo como repo hermano (`../fred-hub`).
+
+Desde 2026-06-15 existe el **artefacto cifrado `.fdb`** (`src/fdb.ts` + `src/seal.ts`, comandos `build`, `seal`, `open`, `wizard`): sucesor cifrado del `.db` que empaqueta la base SQLite completa como `HEADER` en claro + `PAYLOAD` AES-256-GCM + firma HMAC-SHA256. El header lleva metadatos no sensibles (repo, schema, contadores `n_summaries`/`n_embeddings`, longitudes de zonas) para que el hub valide sin descifrar; el contenido se descifra **solo en memoria, nunca a disco** (`openFdbToMemory` vía `deserialize`). `ask`/`chat`/`tui` aceptan un `.fdb` con `--passphrase` (o env `FRED_FDB_PASSPHRASE`). El diseño completo y su encaje comercial están en `docs/fred-fdb-implementacion.md` y `docs/fred-modelo-negocio.md`.
 
 ### Stack
 
@@ -35,9 +37,15 @@ src/
   embed.ts     # Fase 2: embeddings de los resúmenes vía Voyage AI
   rag.ts       # Fase 3: agente RAG (search_summaries vectorial + query_graph SQL solo lectura)
   server.ts    # Fase 3: endpoint de chat Express (POST /chat, sesiones en memoria)
-  setup.ts     # Fase 3: preparación interactiva de la sesión (resuelve API keys — env o ~/.fred/credentials.json — y resuelve/crea la base)
-  cli.ts       # Comandos: analyze, stats, who-calls, calls-of, search, impact, summarize, summaries, embed, ask, serve
-  index.ts     # Superficie de librería (la consume fred-hub): RagAgent, CodeDB, readMeta, gitInfo, etc.
+  setup.ts     # Fase 3: preparación interactiva de la sesión (resuelve API keys — env o ~/.fred/credentials.json —, resuelve/crea la base, y prepara sesiones .fdb)
+  fdb.ts       # Formato .fdb: spec binario del HEADER en claro (encode/decode/isFdb)
+  seal.ts      # Formato .fdb: sellado (.db → .fdb cifrado) y apertura (sealDb, openFdb, openFdbToMemory)
+  fdb.test.ts  # Tests del header .fdb (npx tsx --test src/fdb.test.ts)
+  cli.ts       # Comandos: analyze, stats, who-calls, calls-of, search, impact, summarize, summaries, embed, ask, chat, tui, serve, build, seal, open, wizard
+  index.ts     # Superficie de librería (la consume fred-hub): RagAgent, CodeDB, readMeta, gitInfo, sealDb, openFdb(ToMemory), encode/decodeFdbHeader, etc.
+docs/
+  fred-fdb-implementacion.md # Diseño técnico del formato .fdb (contexto, layout, decisiones)
+  fred-modelo-negocio.md     # Estrategia comercial: planes, seguridad por tier, costos, backend de IA
 sample-shop/   # Repo TypeScript de prueba con lógica de negocio realista
 ```
 
@@ -51,6 +59,11 @@ sample-shop/   # Repo TypeScript de prueba con lógica de negocio realista
     - `doc`: JSDoc — materia prima para los resúmenes LLM de la Fase 2
 - `calls(caller_id, callee_id, callee_name, line)` — `callee_id` NULL = llamada externa no resuelta
 - `imports(file_id, module, named)`
+- `summaries(id, symbol_id|file_id|domain, level, body_hash, text, model, created_at)` y `embeddings(summary_id, body_hash, vector BLOB, dims, model)` (Fase 2).
+
+### Formato `.fdb` (artefacto cifrado, esquema en `src/fdb.ts`)
+
+`HEADER` (texto plano, no sensible) + `PAYLOAD` (AES-256-GCM = el `.db` SQLite completo) + `FIRMA` (HMAC-SHA256 sobre header+payload). El header es little-endian: magic `FRED01`, `header_version`, flags, `schema_version`, `generated_at`, contadores `n_summaries`/`n_embeddings`, longitudes de payload/firma, `repo_name` y fingerprint de clave. La clave se deriva de la passphrase con `scrypt` + salt por archivo. Regla dura: **los datos descifrados nunca tocan disco** (`openFdbToMemory` carga vía `deserialize` en una base `:memory:`).
 
 ### Comandos
 
@@ -61,6 +74,16 @@ npx tsx src/cli.ts who-calls <símbolo> --db out.db
 npx tsx src/cli.ts calls-of <símbolo> --db out.db
 npx tsx src/cli.ts search <texto> --db out.db
 npx tsx src/cli.ts impact <símbolo> --db out.db --depth 3
+# Fase 2/3
+npx tsx src/cli.ts summarize <repo> --db out.db   # ANTHROPIC_API_KEY
+npx tsx src/cli.ts embed --db out.db              # VOYAGE_API_KEY
+npx tsx src/cli.ts ask "<pregunta>" --db out.db   # acepta también out.fdb --passphrase <p>
+npx tsx src/cli.ts chat|tui|serve --db out.db
+# Artefacto .fdb (passphrase: --passphrase <p> o env FRED_FDB_PASSPHRASE)
+npx tsx src/cli.ts build <repo> --out out.fdb --passphrase <p>  # analyze→summarize→embed→seal en un paso
+npx tsx src/cli.ts wizard --db out.db --out out.fdb             # asistente interactivo + sellado
+npx tsx src/cli.ts seal out.db --out out.fdb --passphrase <p>   # cifra un .db existente
+npx tsx src/cli.ts open out.fdb --passphrase <p>                # descifra/valida y muestra header (sin escribir a disco)
 ```
 
 Prueba de humo tras cualquier cambio en analyzer.ts o db.ts:
@@ -70,6 +93,12 @@ npx tsx src/cli.ts analyze ./sample-shop --db /tmp/shop.db
 # Esperado: 5 archivos, 12 símbolos, 12 llamadas (8 resueltas)
 npx tsx src/cli.ts impact roundMoney --db /tmp/shop.db
 # Esperado: calculateSubtotal y applyDiscount en nivel 1; OrderService.createOrder y recalculate en nivel 2
+```
+
+Tras cualquier cambio en `fdb.ts` o `seal.ts`, corre además los tests del header:
+
+```bash
+npx tsx --test src/fdb.test.ts
 ```
 
 ## Decisiones de diseño (no revertir sin discutirlo)
@@ -115,7 +144,7 @@ GitHub App + webhooks (análisis incremental por archivo cambiado, propagando re
 
 ### Visión multi-repo: RAG global corporativo (habilitadores y hub MVP implementados 2026-06-11)
 
-En un corporativo una solución real son varios repos/componentes (potencialmente en varios lenguajes). El plan: cada pipeline de CI (Jenkins) corre `fred analyze && summarize && embed` y publica su `repo.db` como artefacto; un servicio central ("fred-hub") los ingiere y expone el mismo agente RAG con alcance de solución. El `.db` es la pieza correcta porque ya lleva precalculado lo caro (resúmenes + embeddings) y la idempotencia por hash hace barato cada deploy — el hub solo recolecta e indexa, no recomputa.
+En un corporativo una solución real son varios repos/componentes (potencialmente en varios lenguajes). El plan: cada pipeline de CI (Jenkins) corre `fred analyze && summarize && embed` (o `fred build` en un solo paso) y publica su artefacto — `repo.db` o, preferentemente para distribución, el `repo.fdb` cifrado; un servicio central ("fred-hub") los ingiere y expone el mismo agente RAG con alcance de solución. El artefacto es la pieza correcta porque ya lleva precalculado lo caro (resúmenes + embeddings) y la idempotencia por hash hace barato cada deploy — el hub solo recolecta e indexa, no recomputa. El `.fdb` cifra ese artefacto para que la lógica de negocio (sensible aunque no reconstruya el código) viaje protegida; ver `docs/fred-fdb-implementacion.md` y `docs/fred-modelo-negocio.md`.
 
 Escala y decisiones:
 
@@ -135,3 +164,26 @@ Orden: (1) ✅ tabla `meta`, (2) paso de CI (Jenkins) que publique el artefacto 
 - Cualquier cambio al esquema de SQLite debe ser retrocompatible o incluir migración en `CodeDB`.
 - Corre la prueba de humo de arriba antes de dar por terminado un cambio.
 - No implementes Fase 3 antes de que Fase 2 esté validada con un repo real.
+
+## Anexo A — Viabilidad de Amazon Bedrock como backend de Claude (posible mejora)
+
+Análisis (2026-06-14) de enrutar las llamadas a Claude por **Amazon Bedrock** en lugar de la API directa de Anthropic, autenticando con credenciales AWS. **Estado: propuesta, no implementada.**
+
+**Veredicto:** viable y de bajo riesgo para las llamadas a Claude; la pieza de embeddings (Voyage) NO se mueve a Bedrock.
+
+Bedrock es operado por AWS (no por Anthropic) pero sirve la misma forma de la Messages API. Todo lo que fred usa de Claude está soportado: `messages.create` (`summarize.ts`), `messages.stream` (`rag.ts`), `tools` cliente-side con loop agéntico manual (`search_summaries` / `query_graph`), `thinking: {type:"adaptive"}`, `stop_reason: "refusal"` / `pause_turn`, y el backoff del SDK (`maxRetries`). Lo que Bedrock NO soporta (Managed Agents, herramientas server-side de Anthropic, Task Budgets, `fallbacks` server-side) fred no lo usa, así que no hay choque.
+
+**Punto clave — los embeddings son independientes del proveedor.** `embed.ts` y `RagAgent.searchSummaries` usan **Voyage AI**, que no vive en Bedrock; mover Claude a Bedrock no mueve Voyage. Caminos:
+- **Recomendado (fase 1):** dejar Voyage tal cual; solo las llamadas a Claude van por Bedrock. Se sigue necesitando `VOYAGE_API_KEY`. Cero recálculo.
+- **Más invasivo:** cambiar a un modelo de embeddings de Bedrock (Titan v2 = 1024 dims, o Cohere). Cambia el espacio vectorial → re-embeber todo, y mezcla espacios distintos entre `.db` federados (aunque `searchSummaries` ya tolera varios modelos fusionando por score). No hacerlo ahora.
+
+**Autenticación "a través de claves":** Bedrock usa credenciales AWS (SigV4): `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ opcional `AWS_SESSION_TOKEN`) y `AWS_REGION`, o rol IAM / perfil. El cliente `AnthropicBedrock` (`@anthropic-ai/bedrock-sdk`) las lee del entorno o del constructor. Encaja con el patrón actual de `setup.ts` (env → `~/.fred/credentials.json` → preguntar): basta agregar estas claves a `API_KEYS` y a la resolución.
+
+**Cambios necesarios (acotados):**
+1. **Cliente:** `npm i @anthropic-ai/bedrock-sdk`. Una factory que devuelva `new Anthropic()` o `new AnthropicBedrock()`; el resto de `summarize.ts`/`rag.ts` no cambia (ambos exponen `.messages.create/.stream` idénticos).
+2. **IDs de modelo:** Bedrock exige prefijo de proveedor → `anthropic.claude-opus-4-8` (a menudo inference profile regional `us.anthropic.claude-opus-4-8`). Un `claude-*` pelado da 400 en Bedrock.
+3. **Tabla `PRICING` (`rag.ts`):** está indexada por `claude-opus-4-8`; con el ID de Bedrock `estimateCost` devuelve `null`. Normalizar la clave (quitar `anthropic.`/`us.`) o añadir entradas Bedrock (sus tarifas difieren un poco de la API directa).
+4. **`summaries.model`:** guardaría el ID con prefijo; conviene normalizar para mantener coherente la idempotencia por hash y el reporte de uso entre proveedores.
+5. **Superficie de librería (`index.ts` → fred-hub):** propagar la elección de proveedor por `RagOptions`/config para que el hub también pueda apuntar a Bedrock.
+
+**Verificar antes de implementar:** (a) que `claude-opus-4-8` esté habilitado en la región/cuenta de Bedrock (model access) — es el bloqueante real más común; (b) cuotas de Bedrock (por región/modelo, distintas a las de la API directa).
