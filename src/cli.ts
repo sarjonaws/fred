@@ -28,6 +28,7 @@ import { summarize } from "./summarize.js";
 import { embedSummaries } from "./embed.js";
 import { RagAgent, formatUsage } from "./rag.js";
 import { serve } from "./server.js";
+import { viewer } from "./viewer.js";
 import { prepareSession, prepareFdbSession, resolveApiKeys, resolveSealPassphrase } from "./setup.js";
 import { sealDb, openFdb } from "./seal.js";
 
@@ -371,13 +372,14 @@ program
 program
   .command("tui")
   .description("interfaz interactiva TUI (Ink): markdown renderizado, spinner, streaming")
-  .option("--db <path>", "archivo SQLite", "code.db")
+  .option("--db <path>", "archivo SQLite (.db) o artefacto cifrado (.fdb)", "code.db")
   .option("--model <id>", "modelo de Claude", "claude-opus-4-8")
+  .option("--passphrase <p>", "passphrase si --db es un .fdb (o env FRED_FDB_PASSPHRASE)")
   .action((opts) => run(async () => {
-    const dbPath = await prepareSession({ dbPath: opts.db, model: opts.model });
+    const { agent, label } = await buildAgent({ db: opts.db, model: opts.model, passphrase: opts.passphrase });
     // Import dinámico: no cargar React/Ink para los demás comandos
     const { runTui } = await import("./tui.js");
-    runTui({ dbPath, model: opts.model });
+    runTui({ agent, label, model: opts.model });
   }));
 
 // Passphrase de cifrado: flag explícito o env. Sin TTY no preguntamos (CI-friendly).
@@ -543,6 +545,18 @@ program
   .option("--model <id>", "modelo de Claude", "claude-opus-4-8")
   .action((opts) => run(async () => {
     serve({ dbPath: opts.db, port: Number(opts.port), model: opts.model });
+  }));
+
+program
+  .command("view")
+  .description("abre un visor web de solo lectura para inspeccionar un .fdb (datos solo en memoria)")
+  .argument("<fdb>", "archivo .fdb de entrada")
+  .option("--passphrase <p>", "passphrase de cifrado (o env FRED_FDB_PASSPHRASE)")
+  .option("--port <n>", "puerto HTTP", "4000")
+  .option("--no-open", "no abrir el navegador automáticamente")
+  .action((fdb, opts) => run(async () => {
+    const passphrase = resolvePassphrase(opts.passphrase);
+    viewer({ fdbPath: fdb, passphrase, port: Number(opts.port), open: opts.open });
   }));
 
 program.parse();

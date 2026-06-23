@@ -14,6 +14,8 @@ export { summarize } from "./summarize.js";
 export { embedSummaries, voyageEmbed } from "./embed.js";
 export { sealDb, openFdb, openFdbToMemory } from "./seal.js";
 export type { SealResult, OpenResult } from "./seal.js";
+export { viewer } from "./viewer.js";
+export type { ViewerOptions } from "./viewer.js";
 export {
   encodeFdbHeader,
   decodeFdbHeader,
